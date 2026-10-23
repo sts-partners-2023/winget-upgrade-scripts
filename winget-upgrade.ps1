@@ -9,18 +9,26 @@
   最後に一時停止しない（タスク スケジューラ用）
 .PARAMETER ListOnly
   更新せず、対象の一覧だけを表示する
+.PARAMETER ResultFile
+  内部用。Machine が結果を親へ渡す JSON のパス
 #>
 param(
     [ValidateSet('User', 'All', 'Machine')]
     [string]$Mode = 'User',
     [switch]$NoPause,
-    [switch]$ListOnly
+    [switch]$ListOnly,
+    [string]$ResultFile
 )
 
 $ErrorActionPreference = 'Stop'
 $AppName = 'winget-upgrade-scripts'
 $script:Mutex = $null
 $script:Transcribing = $false
+# winget が「仕様として更新しない」ことを示す終了コード
+$BlockedCodes = @{
+    -1978335189 = '適用できる更新がない'                                       # 0x8A15002B
+    -1978335090 = 'インストール方式が異なる（アンインストール後に再導入が必要）' # 0x8A15008E
+}
 
 # winget は UTF-8 で出力するため、パイプ経由でも日本語が文字化けしないようにする
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
@@ -61,20 +69,63 @@ function Install-Winget {
     return Get-WingetPath
 }
 
-function Invoke-WingetUpgrade([string]$Winget, [string]$Scope) {
-    if ($ListOnly) {
-        Write-Step "[$Scope スコープ] 更新対象の一覧"
-        & $Winget upgrade --include-unknown --scope $Scope --accept-source-agreements --disable-interactivity | Out-Host
-    } else {
-        Write-Step "[$Scope スコープ] アップグレードを開始します"
-        & $Winget upgrade --all --include-unknown --scope $Scope --silent --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
+# 一覧の表から (Id, Name) を取り出す。列位置は全角文字でずれるため、行末の 4 列（ID・現在・利用可能・ソース）から逆算する
+function Get-UpgradeTargets([string]$List) {
+    $lines = $List -split "`r?`n"
+    $sep = 0..($lines.Count - 1) | Where-Object { $lines[$_] -match '^-{5,}\s*$' } | Select-Object -First 1
+    if ($null -eq $sep) { return @() }
+    $targets = foreach ($line in $lines[($sep + 1)..($lines.Count - 1)]) {
+        $tok = @($line.Trim() -split '\s+')
+        if ($tok.Count -lt 5) { break }
+        $v = $tok.Count - 3                                  # 現在のバージョン
+        if ($tok[$v - 1] -match '^[<>~]+$') { $v-- }         # "< 1.2" のような記号付き
+        if ($v -lt 2) { break }
+        [pscustomobject]@{ Id = $tok[$v - 1]; Name = ($tok[0..($v - 2)] -join ' ') }
     }
-    return [int]$LASTEXITCODE
+    return @($targets | Group-Object Id | ForEach-Object { $_.Group[0] })
+}
+
+# 0: 成功 / Blocked: winget が仕様として更新しない / Failed: それ以外
+function Get-Category([int]$Code) {
+    if ($Code -eq 0) { return 'Success' }
+    if ($Code -in $BlockedCodes.Keys) { return 'Blocked' }
+    return 'Failed'
 }
 
 function Format-Code([int]$Code) {
-    if ($Code -eq 0) { return '成功 (0)' }
+    if ($Code -eq 0) { return '成功' }
+    if ($BlockedCodes.Contains($Code)) { return "ブロック: $($BlockedCodes[$Code])" }
     return ('失敗 (0x{0:X8})' -f $Code)
+}
+
+function New-Result([string]$Scope, [string]$Id, [string]$Name, [int]$Code) {
+    [pscustomobject]@{ Scope = $Scope; Id = $Id; Name = $Name; Code = $Code }
+}
+
+# パッケージごとに更新し、1 件の失敗で残りを止めない。戻り値は結果の配列
+function Invoke-WingetUpgrade([string]$Winget, [string]$Scope) {
+    Write-Step "[$Scope スコープ] 更新対象の一覧"
+    $list = (& $Winget upgrade --include-unknown --scope $Scope --accept-source-agreements --disable-interactivity | Out-String)
+    $listCode = [int]$LASTEXITCODE
+    Write-Host $list
+    if ($ListOnly) { return @(New-Result $Scope $null '一覧のみ' $listCode) }
+    if ($listCode -ne 0) { return @(New-Result $Scope $null '一覧の取得' $listCode) }
+
+    $targets = @(Get-UpgradeTargets $list)
+    if ($targets.Count -eq 0) {
+        Write-Step "[$Scope スコープ] 更新対象はありません"
+        return @(New-Result $Scope $null '更新対象なし' 0)
+    }
+
+    $items = @()
+    $n = 0
+    foreach ($t in $targets) {
+        $n++
+        Write-Step "[$Scope スコープ] ($n/$($targets.Count)) $($t.Name) [$($t.Id)] を更新します"
+        & $Winget upgrade --id $t.Id --exact --include-unknown --scope $Scope --silent --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
+        $items += New-Result $Scope $t.Id $t.Name ([int]$LASTEXITCODE)
+    }
+    return $items
 }
 
 # ---- 権限の確認 ----
@@ -129,39 +180,70 @@ if (-not $winget) {
 Write-Step "winget: $winget ($(& $winget --version))"
 
 # ---- アップグレード ----
-$results = [ordered]@{}
+$items = @()
 if ($Mode -in 'User', 'All') {
-    $results['user'] = Invoke-WingetUpgrade $winget 'user'
+    $items += Invoke-WingetUpgrade $winget 'user'
 }
 if ($Mode -eq 'Machine') {
-    $results['machine'] = Invoke-WingetUpgrade $winget 'machine'
+    $items += Invoke-WingetUpgrade $winget 'machine'
 }
 if ($Mode -eq 'All') {
     if ($ListOnly) {
-        $results['machine'] = Invoke-WingetUpgrade $winget 'machine'
+        $items += Invoke-WingetUpgrade $winget 'machine'
     } else {
         Write-Step '[machine スコープ] 管理者権限で実行します（UAC が表示されます）'
+        $childResult = Join-Path $env:TEMP ("{0}-machine-{1}.json" -f $AppName, $PID)
+        Remove-Item $childResult -ErrorAction SilentlyContinue
         try {
-            $argList = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Mode Machine -NoPause' -f $PSCommandPath
-            $p = Start-Process powershell.exe -Verb RunAs -WindowStyle Minimized -Wait -PassThru -ArgumentList $argList
-            $results['machine'] = $p.ExitCode
+            $argList = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Mode Machine -NoPause -ResultFile "{1}"' -f $PSCommandPath, $childResult
+            $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList $argList
+            if (Test-Path $childResult) {
+                $items += @(Get-Content $childResult -Raw -Encoding UTF8 | ConvertFrom-Json)
+            } else {
+                $items += New-Result 'machine' $null '管理者側の実行' ([int]$p.ExitCode)
+            }
         } catch {
             Write-Step "管理者での実行を開始できませんでした（UAC で拒否された可能性があります）: $($_.Exception.Message)"
-            $results['machine'] = -1
+            $items += New-Result 'machine' $null '管理者側の実行' -1
+        } finally {
+            Remove-Item $childResult -ErrorAction SilentlyContinue
         }
     }
+}
+
+# Machine は結果を親へ渡す
+if ($Mode -eq 'Machine' -and $ResultFile) {
+    ConvertTo-Json -InputObject @($items) | Set-Content -Path $ResultFile -Encoding UTF8
 }
 
 # ---- 結果 ----
 Write-Host ''
 Write-Step '結果'
-$worst = 0
-foreach ($k in $results.Keys) {
-    Write-Host ("  {0,-8}: {1}" -f $k, (Format-Code $results[$k]))
-    if ($results[$k] -ne 0) { $worst = 1 }
+$failed = 0
+foreach ($scope in 'user', 'machine') {
+    $s = @($items | Where-Object { $_.Scope -eq $scope })
+    if ($s.Count -eq 0) { continue }
+    $pkgs = @($s | Where-Object { $_.Id })
+    if ($pkgs.Count -eq 0) {
+        # パッケージ単位ではない結果（更新なし・一覧のみ・取得失敗など）
+        $r = $s[0]
+        $text = if ($r.Code -eq 0) { $r.Name } else { '{0}: {1}' -f $r.Name, (Format-Code $r.Code) }
+        if ($r.Code -ne 0) { $failed++ }
+        Write-Host ("  {0,-8}: {1}" -f $scope, $text)
+        continue
+    }
+    $ok = @($pkgs | Where-Object { (Get-Category $_.Code) -eq 'Success' }).Count
+    $blocked = @($pkgs | Where-Object { (Get-Category $_.Code) -eq 'Blocked' }).Count
+    $ng = @($pkgs | Where-Object { (Get-Category $_.Code) -eq 'Failed' }).Count
+    $failed += $ng
+    Write-Host ("  {0,-8}: 対象 {1} 件 / 成功 {2} / 失敗 {3} / ブロック {4}" -f $scope, $pkgs.Count, $ok, $ng, $blocked)
+    foreach ($i in $pkgs) {
+        Write-Host ("      {0} [{1}]: {2}" -f $i.Name, $i.Id, (Format-Code $i.Code))
+    }
 }
 if ($Mode -eq 'User') {
     Write-Host '  machine スコープは対象外です。全件を更新するには winget-upgrade-all.cmd を使ってください。'
 }
 Write-Host "  ログ: $logFile （winget の詳細ログは 'winget --logs' で開けます）"
-Exit-Script $worst
+# ブロック（winget が仕様として更新しないもの）は終了コードには含めない
+Exit-Script ([int]($failed -gt 0))

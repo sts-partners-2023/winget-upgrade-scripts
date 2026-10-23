@@ -99,7 +99,7 @@ if ($Mode -ne 'Machine') {
 }
 
 # ---- ログ ----
-$logDir = Join-Path $env:LOCALAPPDATA "$AppName\logs"
+$logDir = Join-Path ([Environment]::GetFolderPath('Desktop')) "$AppName-logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $logFile = Join-Path $logDir ("{0}-{1}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $Mode)
 Start-Transcript -Path $logFile | Out-Null

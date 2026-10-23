@@ -59,7 +59,7 @@ winget pin add --id <パッケージ ID>
 固定したパッケージは `--all` でも更新されません。
 
 ## ログ
-`%LOCALAPPDATA%\winget-upgrade-scripts\logs\` に実行ごとのログが保存されます。
+デスクトップの `winget-upgrade-scripts-logs` フォルダーに、実行ごとのログが保存されます。
 winget 自体の詳細ログは `winget --logs` で開けます。
 
 ## ライセンス
